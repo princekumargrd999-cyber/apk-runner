@@ -2,6 +2,6 @@ name = "apk-runner"
 main = "src/worker.js"
 compatibility_date = "2025-01-01"
 
-[[r2_buckets]]
-binding = "BUCKET"
-bucket_name = "apk-runner-files"
+[[kv_namespaces]]
+binding = "KV"
+id = "KV_ID_PLACEHOLDER"

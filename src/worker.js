@@ -6,8 +6,10 @@ iframe{width:100%;height:80vh;border:0;margin-top:10px}</style>
 <h2>APK Runner</h2>
 <input id=pw type=password placeholder="Password">
 <input id=f type=file accept=".apk">
+<p id=info></p>
+<progress id=bar max=100 value=0 style="width:100%;display:none"></progress>
 <button id=go>Upload &amp; Run</button>
-<button id=stop>Stop auto-restart</button>
+<button id=stop>Cancel / Stop</button>
 <p id=msg></p><div id=out></div>
 <script>
 const $=i=>document.getElementById(i),msg=t=>$('msg').textContent=t;
@@ -28,26 +30,47 @@ function poll(){
  };
  tick(); iv=setInterval(tick,6000);
 }
-$('go').onclick=async()=>{
+let curX=null,uploading=false,aborted=false;
+const mb=b=>(b/1048576).toFixed(1)+' MB';
+$('f').onchange=()=>{const f=$('f').files[0];$('info').textContent=f?f.name+' - '+mb(f.size):'';};
+function put(url,body,onp){return new Promise(res=>{const x=new XMLHttpRequest();curX=x;x.open('PUT',url);
+ const h=H();for(const k in h)x.setRequestHeader(k,h[k]);
+ x.upload.onprogress=e=>onp&&onp(e.loaded);
+ x.onload=()=>res({ok:x.status<300,text:x.responseText});
+ x.onerror=()=>res({ok:false,text:'network error'});x.onabort=()=>res({ok:false,text:'cancelled'});x.send(body);});}
+async function doUpload(){
  const f=$('f').files[0]; if(!f) return msg('Select an APK');
  localStorage.setItem('pw',$('pw').value);
  const key=[...crypto.getRandomValues(new Uint8Array(12))].map(b=>b.toString(16).padStart(2,'0')).join('');
  const C=20*1024*1024, n=Math.ceil(f.size/C);
  if(n>10) return msg('APK bahut badi hai (max 200 MB)');
- let r;
+ const bar=$('bar'); bar.style.display='block'; bar.value=0;
+ let sent=0,r;const t0=Date.now();
  for(let i=0;i<n;i++){
-  msg('Uploading '+(i+1)+'/'+n+'...');
-  r=await fetch('/api/upload?key='+key+'&i='+i,{method:'PUT',headers:H(),body:f.slice(i*C,(i+1)*C)});
-  if(!r.ok) return msg('Upload failed: '+await r.text());
+  const chunk=f.slice(i*C,(i+1)*C);
+  r=await put('/api/upload?key='+key+'&i='+i,chunk,l=>{
+   const t=sent+l,pc=Math.min(100,Math.round(t/f.size*100));
+   bar.value=pc;
+   const sec=Math.max((Date.now()-t0)/1000,0.2),sp=t/sec,eta=Math.max(0,Math.round((f.size-t)/sp));
+   msg('Uploading '+pc+'% ('+mb(t)+' / '+mb(f.size)+') | Speed: '+mb(sp)+'/s ('+(sp*8/1e6).toFixed(1)+' Mbps) | Baaki: '+eta+' sec');});
+  if(aborted){bar.style.display='none';return msg('Upload cancel kiya');}
+  if(!r.ok) return msg('Upload failed: '+r.text);
+  sent+=chunk.size;
  }
- r=await fetch('/api/upload?key='+key+'&done='+n,{method:'PUT',headers:H()});
- if(!r.ok) return msg('Upload failed: '+await r.text());
+ r=await put('/api/upload?key='+key+'&done='+n,null);
+ if(!r.ok) return msg('Upload failed: '+r.text);
+ bar.value=100; msg('Upload 100% ('+mb(f.size)+'). Session start ho raha hai...');
  r=await fetch('/api/start',{method:'POST',headers:{...H(),'content-type':'application/json'},body:JSON.stringify({key})});
  if(!r.ok) return msg('Start failed: '+await r.text());
  shown=''; $('out').innerHTML=''; poll();
-};
+}
+$('go').onclick=async()=>{uploading=true;aborted=false;try{await doUpload();}finally{uploading=false;}};
 $('stop').onclick=async()=>{
- const r=await fetch('/api/stop',{method:'POST',headers:H()}); msg(r.ok?'Auto-restart band kar diya':'Failed');
+ if(uploading){aborted=true;if(curX)curX.abort();return;}
+ msg('Cancel ho raha hai...');
+ const r=await fetch('/api/stop',{method:'POST',headers:H()});
+ shown=''; $('out').innerHTML=''; $('bar').style.display='none';
+ msg(r.ok?'Cancel ho gaya: chalta session aur auto-restart dono band':'Cancel failed');
 };
 if($('pw').value) poll();
 </script>`;
@@ -109,7 +132,17 @@ export default {
     }
     if (p === "/api/stop" && req.method === "POST") {
       if (!userOk) return deny();
-      const s = await getState(env); s.stopped = true; await setState(env, s);
+      const s = await getState(env);
+      await setState(env, { apk_key: s.apk_key, stopped: true });
+      // cancel any running or queued session on GitHub
+      for (const st of ["in_progress", "queued"]) {
+        try {
+          const gh = { Authorization: `Bearer ${env.GH_TOKEN}`, "User-Agent": "apk-runner", Accept: "application/vnd.github+json" };
+          const lr = await fetch(`https://api.github.com/repos/${env.GH_REPO}/actions/workflows/session.yml/runs?status=${st}`, { headers: gh });
+          const runs = (await lr.json()).workflow_runs || [];
+          for (const r of runs) await fetch(`https://api.github.com/repos/${env.GH_REPO}/actions/runs/${r.id}/cancel`, { method: "POST", headers: gh });
+        } catch (e) {}
+      }
       return json({ ok: true });
     }
     if (p === "/api/callback" && req.method === "POST") {

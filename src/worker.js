@@ -31,10 +31,17 @@ function poll(){
 $('go').onclick=async()=>{
  const f=$('f').files[0]; if(!f) return msg('Select an APK');
  localStorage.setItem('pw',$('pw').value);
- msg('Uploading...');
- let r=await fetch('/api/upload',{method:'PUT',headers:H(),body:f});
+ const key=[...crypto.getRandomValues(new Uint8Array(12))].map(b=>b.toString(16).padStart(2,'0')).join('');
+ const C=20*1024*1024, n=Math.ceil(f.size/C);
+ if(n>10) return msg('APK bahut badi hai (max 200 MB)');
+ let r;
+ for(let i=0;i<n;i++){
+  msg('Uploading '+(i+1)+'/'+n+'...');
+  r=await fetch('/api/upload?key='+key+'&i='+i,{method:'PUT',headers:H(),body:f.slice(i*C,(i+1)*C)});
+  if(!r.ok) return msg('Upload failed: '+await r.text());
+ }
+ r=await fetch('/api/upload?key='+key+'&done='+n,{method:'PUT',headers:H()});
  if(!r.ok) return msg('Upload failed: '+await r.text());
- const {key}=await r.json();
  r=await fetch('/api/start',{method:'POST',headers:{...H(),'content-type':'application/json'},body:JSON.stringify({key})});
  if(!r.ok) return msg('Start failed: '+await r.text());
  shown=''; $('out').innerHTML=''; poll();
@@ -48,9 +55,10 @@ if($('pw').value) poll();
 const json = (o, s = 200) => new Response(JSON.stringify(o), { status: s, headers: { "content-type": "application/json" } });
 const rid = () => [...crypto.getRandomValues(new Uint8Array(12))].map(b => b.toString(16).padStart(2, "0")).join("");
 const MINUTES = "335"; // max for a GitHub-hosted job is 360 min including setup
+const KEYRE = /^[0-9a-f]{24}$/;
 
-const getState = async env => { const o = await env.BUCKET.get("state/current.json"); return o ? await o.json() : {}; };
-const setState = (env, s) => env.BUCKET.put("state/current.json", JSON.stringify(s));
+const getState = async env => (await env.KV.get("state", "json")) || {};
+const setState = (env, s) => env.KV.put("state", JSON.stringify(s));
 const dispatch = (env, id, token, apk_key) =>
   fetch(`https://api.github.com/repos/${env.GH_REPO}/actions/workflows/session.yml/dispatches`, {
     method: "POST",
@@ -67,15 +75,27 @@ export default {
 
     if (p === "/") return new Response(PAGE, { headers: { "content-type": "text/html;charset=utf-8" } });
 
+    // APK is uploaded in 20 MB chunks (KV value limit is 25 MB)
     if (p === "/api/upload" && req.method === "PUT") {
       if (!userOk) return deny();
-      const key = rid() + ".apk";
-      await env.BUCKET.put("apk/" + key, req.body);
-      return json({ key });
+      const key = url.searchParams.get("key");
+      if (!KEYRE.test(key || "")) return new Response("bad key", { status: 400 });
+      const done = url.searchParams.get("done");
+      if (done !== null) {
+        const n = Number(done);
+        if (!(n >= 1 && n <= 10)) return new Response("bad count", { status: 400 });
+        await env.KV.put(`apk:${key}:n`, String(n));
+        return json({ ok: true });
+      }
+      const i = Number(url.searchParams.get("i"));
+      if (!(i >= 0 && i <= 9)) return new Response("bad index", { status: 400 });
+      await env.KV.put(`apk:${key}:${i}`, await req.arrayBuffer());
+      return json({ ok: true });
     }
     if (p === "/api/start" && req.method === "POST") {
       if (!userOk) return deny();
       const { key } = await req.json();
+      if (!KEYRE.test(key || "")) return new Response("bad key", { status: 400 });
       const id = rid(), token = rid();
       const r = await dispatch(env, id, token, key);
       if (!r.ok) return new Response("github: " + (await r.text()), { status: 502 });
@@ -114,10 +134,17 @@ export default {
       await setState(env, s);
       return json({ started: nid });
     }
+    // Runner downloads: /apk/<key>/n (chunk count) and /apk/<key>/<i>
     if (p.startsWith("/apk/")) {
       if (!runnerOk) return deny();
-      const o = await env.BUCKET.get("apk/" + p.slice(5));
-      return o ? new Response(o.body) : new Response("missing", { status: 404 });
+      const [, , key, part] = p.split("/");
+      if (!KEYRE.test(key || "")) return new Response("bad key", { status: 400 });
+      if (part === "n") {
+        const n = await env.KV.get(`apk:${key}:n`);
+        return n ? new Response(n) : new Response("missing", { status: 404 });
+      }
+      const b = await env.KV.get(`apk:${key}:${Number(part)}`, "arrayBuffer");
+      return b ? new Response(b) : new Response("missing", { status: 404 });
     }
     return new Response("not found", { status: 404 });
   },

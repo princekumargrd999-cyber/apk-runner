@@ -7,20 +7,36 @@ on:
 jobs:
   deploy:
     runs-on: ubuntu-latest
+    env:
+      CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+      CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+      PASSWORD: ${{ secrets.APP_PASSWORD }}
+      GH_TOKEN: ${{ secrets.GH_PAT }}
+      GH_REPO: ${{ github.repository }}
+      CALLBACK_SECRET: ${{ secrets.CALLBACK_SECRET }}
     steps:
       - uses: actions/checkout@v4
-      - uses: cloudflare/wrangler-action@v3
-        with:
-          apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}
-          accountId: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
-          preCommands: npx wrangler r2 bucket create apk-runner-files || true
-          secrets: |
-            PASSWORD
-            GH_TOKEN
-            GH_REPO
-            CALLBACK_SECRET
-        env:
-          PASSWORD: ${{ secrets.APP_PASSWORD }}
-          GH_TOKEN: ${{ secrets.GH_PAT }}
-          GH_REPO: ${{ github.repository }}
-          CALLBACK_SECRET: ${{ secrets.CALLBACK_SECRET }}
+      - name: Check secrets
+        run: |
+          for v in CLOUDFLARE_API_TOKEN CLOUDFLARE_ACCOUNT_ID PASSWORD GH_TOKEN CALLBACK_SECRET; do
+            if [ -z "${!v}" ]; then echo "MISSING: $v"; miss=1; fi
+          done
+          [ -z "${miss:-}" ] || exit 1
+      - name: Create or find KV namespace
+        run: |
+          API="https://api.cloudflare.com/client/v4/accounts/$CLOUDFLARE_ACCOUNT_ID/storage/kv/namespaces"
+          ID=$(curl -s -H "Authorization: Bearer $CLOUDFLARE_API_TOKEN" "$API?per_page=100" | jq -r '.result[]? | select(.title=="apk-runner-kv") | .id' | head -1)
+          if [ -z "$ID" ]; then
+            RES=$(curl -s -X POST -H "Authorization: Bearer $CLOUDFLARE_API_TOKEN" -H "Content-Type: application/json" -d '{"title":"apk-runner-kv"}' "$API")
+            echo "$RES"
+            ID=$(echo "$RES" | jq -r '.result.id')
+          fi
+          if [ -z "$ID" ] || [ "$ID" = "null" ]; then echo "KV namespace failed (token permission check karo)"; exit 1; fi
+          sed -i "s/KV_ID_PLACEHOLDER/$ID/" wrangler.toml
+      - name: Deploy worker
+        run: npx wrangler deploy
+      - name: Upload secrets
+        run: |
+          jq -n --arg a "$PASSWORD" --arg b "$GH_TOKEN" --arg c "$GH_REPO" --arg d "$CALLBACK_SECRET" \
+            '{PASSWORD:$a,GH_TOKEN:$b,GH_REPO:$c,CALLBACK_SECRET:$d}' > s.json
+          npx wrangler secret bulk s.json

@@ -1,0 +1,46 @@
+name: session
+on:
+  workflow_dispatch:
+    inputs:
+      session_id: { required: true }
+      token: { required: true }
+      apk_key: { required: true }
+      minutes: { default: "335" }
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    steps:
+      - uses: actions/checkout@v4
+      - name: Enable KVM
+        run: |
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules && sudo udevadm trigger --name-match=kvm
+      - uses: actions/setup-node@v4
+        with: { node-version: 20 }
+      - name: Install cloudflared
+        run: |
+          curl -L https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64.deb -o cf.deb
+          sudo dpkg -i cf.deb
+      - name: Download APK
+        run: |
+          H="Authorization: Bearer ${{ secrets.CALLBACK_SECRET }}"
+          U="${{ secrets.WORKER_URL }}/apk/${{ inputs.apk_key }}"
+          N=$(curl -fsS -H "$H" "$U/n")
+          : > app.apk
+          for i in $(seq 0 $((N-1))); do curl -fsS -H "$H" "$U/$i" >> app.apk; done
+          ls -l app.apk
+      - uses: reactivecircus/android-emulator-runner@v2
+        env:
+          SESSION_ID: ${{ inputs.session_id }}
+          SESSION_TOKEN: ${{ inputs.token }}
+          MINUTES: ${{ inputs.minutes }}
+          WORKER_URL: ${{ secrets.WORKER_URL }}
+          CALLBACK_SECRET: ${{ secrets.CALLBACK_SECRET }}
+        with:
+          api-level: 33
+          target: google_apis
+          arch: x86_64
+          profile: pixel_2
+          disable-animations: true
+          script: bash scripts/run.sh

@@ -18,6 +18,11 @@ jobs:
           sudo udevadm control --reload-rules && sudo udevadm trigger --name-match=kvm
       - uses: actions/setup-node@v4
         with: { node-version: 20 }
+      - name: Install stream server deps (ws + scrcpy-server)
+        run: |
+          npm install --prefix runner --omit=dev
+          curl -fsSL -o scrcpy-server.jar https://github.com/Genymobile/scrcpy/releases/download/v3.1/scrcpy-server-v3.1
+          ls -l scrcpy-server.jar
       - name: Install cloudflared
         run: |
           curl -L https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64.deb -o cf.deb

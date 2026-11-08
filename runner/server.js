@@ -11,11 +11,15 @@ const { WebSocketServer } = require("ws");
 const TOKEN = process.env.SESSION_TOKEN;
 const JAR = process.env.SCRCPY_JAR || path.join(process.cwd(), "scrcpy-server.jar");
 const VER = process.env.SCRCPY_VER || "3.1";          // must match the downloaded scrcpy-server version
-const MAX_SIZE = process.env.MAX_SIZE || "960";        // longest side in px
-const BITRATE = process.env.BITRATE || "3000000";      // 3 Mbps
-const FPS = process.env.FPS || "30";
+// Quality presets (device screen is 720x1280 -> "low" is downscaled to 540x960 before encoding)
+const PRESETS = {
+  low:    { size: 960,  br: 2000000,  fps: 24 },
+  medium: { size: 1280, br: 5000000,  fps: 30 },
+  high:   { size: 1280, br: 10000000, fps: 60 },
+};
+let quality = PRESETS[process.env.QUALITY] ? process.env.QUALITY : "medium";
 const FWD_PORT = 27183;
-const MAX_BUFFERED = 512 * 1024;                       // if a client falls behind, drop frames until next keyframe
+const MAX_BUFFERED = 300 * 1024;                       // client behind by ~200ms+ -> drop frames until next keyframe
 const PAGE = fs.readFileSync(path.join(__dirname, "viewer.html"));
 
 const log = (...a) => console.log(new Date().toISOString().slice(11, 19), ...a);
@@ -71,7 +75,7 @@ function onPacket(isConfig, isKey, data) {
   for (const c of clients) {
     if (c.ws.readyState !== 1) continue;
     if (c.needKey) { if (!isKey) continue; c.needKey = false; }
-    else if (c.ws.bufferedAmount > MAX_BUFFERED) { c.needKey = true; requestKeyframe(); continue; }
+    else if (c.ws.bufferedAmount > MAX_BUFFERED) { c.needKey = true; continue; }  // wait for next periodic keyframe
     c.ws.send(out, { binary: true });
   }
 }
@@ -106,15 +110,22 @@ function tryConnect(wantByte) {
   });
 }
 
+let curProc = null;
 async function session() {
+  const q = PRESETS[quality];
+  await adb(["shell", "pkill -f scrcpy.Server"]).catch(() => {});   // kill any leftover server from a previous session
   await adb(["push", JAR, "/data/local/tmp/scrcpy-server.jar"]);
-  await adb(["forward", `tcp:${FWD_PORT}`, "localabstract:scrcpy"]);
+  const scid = Math.floor(Math.random() * 0x7fffffff).toString(16).padStart(8, "0"); // unique socket name per session
+  await adb(["forward", `tcp:${FWD_PORT}`, `localabstract:scrcpy_${scid}`]);
   const opts = [
-    `${VER}`, "log_level=info", "tunnel_forward=true", "video=true", "audio=false", "control=true",
+    `${VER}`, `scid=${scid}`, "log_level=info", "tunnel_forward=true", "video=true", "audio=false", "control=true",
     "send_device_meta=false", "send_frame_meta=true", "send_codec_meta=false",
-    `max_size=${MAX_SIZE}`, `video_bit_rate=${BITRATE}`, `max_fps=${FPS}`, "video_codec=h264", "stay_awake=true",
+    `max_size=${q.size}`, `video_bit_rate=${q.br}`, `max_fps=${q.fps}`, "video_codec=h264", "stay_awake=true",
+    "video_codec_options=i-frame-interval=2",                      // keyframe every 2s -> fast recovery after dropped frames
   ].join(" ");
+  log("starting scrcpy, quality =", quality, JSON.stringify(q));
   const proc = spawn("adb", ["shell", `CLASSPATH=/data/local/tmp/scrcpy-server.jar app_process / com.genymobile.scrcpy.Server ${opts}`]);
+  curProc = proc;
   proc.stdout.on("data", d => log("[scrcpy]", String(d).trim()));
   proc.stderr.on("data", d => log("[scrcpy]", String(d).trim()));
   const exited = new Promise(r => proc.on("exit", r));
@@ -145,7 +156,14 @@ async function supervise() {
   }
 }
 function broadcastStatus() {
-  for (const c of clients) if (c.ws.readyState === 1) c.ws.send(JSON.stringify({ status }));
+  for (const c of clients) if (c.ws.readyState === 1) c.ws.send(JSON.stringify({ status, quality }));
+}
+
+function setQuality(q) {
+  if (!PRESETS[q] || q === quality) return;
+  quality = q; status = "quality change: " + q + " ...";
+  broadcastStatus();
+  if (curProc) curProc.kill();   // session() ends -> supervise() restarts scrcpy with the new preset
 }
 
 // ---------- HTTP + WebSocket ----------
@@ -164,7 +182,7 @@ server.on("upgrade", (req, sock, head) => {
 wss.on("connection", ws => {
   const c = { ws, needKey: true };
   clients.add(c);
-  ws.send(JSON.stringify({ status }));
+  ws.send(JSON.stringify({ status, quality }));
   requestKeyframe();
   ws.on("message", (m, isBinary) => {
     if (isBinary) return;
@@ -173,6 +191,8 @@ wss.on("connection", ws => {
     else if (j.t === "key") sendKey(j.c);
     else if (j.t === "text") sendText(j.s);
     else if (j.t === "idr") { c.needKey = true; requestKeyframe(); }
+    else if (j.t === "ping") ws.send(JSON.stringify({ pong: j.ts }));
+    else if (j.t === "quality") setQuality(j.q);
   });
   ws.on("close", () => clients.delete(c));
   ws.on("error", () => clients.delete(c));

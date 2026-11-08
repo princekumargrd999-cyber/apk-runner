@@ -1,0 +1,8 @@
+{
+  "name": "apk-runner-stream",
+  "private": true,
+  "version": "2.0.0",
+  "dependencies": {
+    "ws": "8.18.0"
+  }
+}

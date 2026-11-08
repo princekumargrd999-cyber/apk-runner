@@ -7,14 +7,16 @@ html,body{margin:0;background:#111;color:#fff;font:13px sans-serif;text-align:ce
 #c{max-height:86vh;max-width:100%;touch-action:none;user-select:none;-webkit-user-select:none;background:#000;outline:0}
 button{padding:10px 16px;margin:4px;font-size:15px}
 #st{opacity:.7;padding:3px}
+#q button.on{background:#2d7;color:#000}
 </style>
 <div id="st">connecting...</div>
 <canvas id="c" width="540" height="960" tabindex="0"></canvas>
+<div id="q"><button data-q="low">Low</button><button data-q="medium">Medium</button><button data-q="high">High</button></div>
 <div><button data-k="4">Back</button><button data-k="3">Home</button><button data-k="187">Recent</button></div>
 <script>
 const T = new URLSearchParams(location.search).get("t");
-const cv = document.getElementById("c"), ctx = cv.getContext("2d"), st = document.getElementById("st");
-let ws = null, dec = null, codec = "", started = false, ts = 0, latest = null, frames = 0, msg = "connecting...";
+const cv = document.getElementById("c"), ctx = cv.getContext("2d", { alpha: false, desynchronized: true }), st = document.getElementById("st");
+let ws = null, rtt = 0, quality = "", dec = null, codec = "", started = false, ts = 0, latest = null, frames = 0, msg = "connecting...";
 let vw = 540, vh = 960;
 const send = o => { if (ws && ws.readyState === 1) ws.send(JSON.stringify(o)); };
 
@@ -33,7 +35,7 @@ function initDecoder(c) {
     output: f => { if (latest) latest.close(); latest = f; },   // keep only the newest frame -> no lag build-up
     error: e => { msg = "decoder error: " + e.message; codec = ""; started = false; send({ t: "idr" }); },
   });
-  dec.configure({ codec: c, optimizeForLatency: true });
+  dec.configure({ codec: c, optimizeForLatency: true, hardwareAcceleration: "prefer-hardware" });
 }
 function draw() {
   if (latest) {
@@ -44,7 +46,9 @@ function draw() {
   requestAnimationFrame(draw);
 }
 requestAnimationFrame(draw);
-setInterval(() => { st.textContent = msg + " | " + frames + " fps"; frames = 0; }, 1000);
+setInterval(() => { st.textContent = msg + " | " + frames + " fps | " + rtt + " ms"; frames = 0;
+  document.querySelectorAll("#q button").forEach(b => b.classList.toggle("on", b.dataset.q === quality)); }, 1000);
+setInterval(() => send({ t: "ping", ts: performance.now() }), 2000);
 
 function connect() {
   ws = new WebSocket((location.protocol === "https:" ? "wss://" : "ws://") + location.host + "/ws?t=" + encodeURIComponent(T));
@@ -52,7 +56,13 @@ function connect() {
   ws.onopen = () => { msg = "connected"; started = false; };
   ws.onclose = () => { msg = "reconnecting..."; setTimeout(connect, 1000); };
   ws.onmessage = ev => {
-    if (typeof ev.data === "string") { msg = JSON.parse(ev.data).status; return; }
+    if (typeof ev.data === "string") {
+      const j = JSON.parse(ev.data);
+      if (j.pong !== undefined) rtt = Math.round(performance.now() - j.pong);
+      if (j.status) msg = j.status;
+      if (j.quality) quality = j.quality;
+      return;
+    }
     if (!("VideoDecoder" in window)) return;
     const u = new Uint8Array(ev.data), key = u[0] === 1, data = u.subarray(1);
     if (key) {
@@ -90,6 +100,7 @@ cv.addEventListener("pointerup", up); cv.addEventListener("pointercancel", up);
 cv.addEventListener("contextmenu", e => e.preventDefault());
 
 // ---- buttons + keyboard (Chromebook keyboard works) ----
+document.querySelectorAll("button[data-q]").forEach(b => b.onclick = () => send({ t: "quality", q: b.dataset.q }));
 document.querySelectorAll("button[data-k]").forEach(b => b.onclick = () => send({ t: "key", c: +b.dataset.k }));
 const KEYS = { Enter: 66, Backspace: 67, Tab: 61, Escape: 4, ArrowUp: 19, ArrowDown: 20, ArrowLeft: 21, ArrowRight: 22, Delete: 112 };
 addEventListener("keydown", e => {

@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 set -u
-adb shell wm size 540x960
-adb shell wm density 240
+# Device resolution: 720x1280 = sharper picture. If the emulator feels slow, use 540x960 + density 240.
+adb shell wm size ${DEV_SIZE:-720x1280}
+adb shell wm density ${DEV_DENSITY:-320}
 adb install -r -t app.apk || echo "install failed"
 SESSION_TOKEN="$SESSION_TOKEN" SCRCPY_JAR="$PWD/scrcpy-server.jar" node runner/server.js > server.log 2>&1 &
 cloudflared tunnel --url http://localhost:8080 --no-autoupdate > tunnel.log 2>&1 &

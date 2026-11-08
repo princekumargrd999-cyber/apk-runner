@@ -6,6 +6,7 @@ iframe{width:100%;height:80vh;border:0;margin-top:10px}</style>
 <h2>APK Runner</h2>
 <input id=pw type=password placeholder="Password">
 <input id=f type=file accept=".apk">
+<input id=u type=url placeholder="Ya APK ka direct link (https://...)" autocomplete=off>
 <p id=info></p>
 <progress id=bar max=100 value=0 style="width:100%;display:none"></progress>
 <button id=go>Upload &amp; Run</button>
@@ -22,6 +23,7 @@ function poll(){
   const s=await fetch('/api/current',{headers:H()}); if(!s.ok) return;
   const c=await s.json(); if(!c.id) return;
   if(c.stopped) msg('Auto-restart band hai (current session khatam hone par ruk jayega)');
+  if(c.error){msg('Error: '+c.error);return;}
   if(!c.url){ if(!shown) msg('Emulator start ho raha hai, 3-5 minute...'); return; }
   const key=c.id+c.url; if(key===shown) return;
   const re=!!shown; shown=key; const u=c.url+'/?t='+c.token;
@@ -39,8 +41,15 @@ function put(url,body,onp){return new Promise(res=>{const x=new XMLHttpRequest()
  x.onload=()=>res({ok:x.status<300,text:x.responseText});
  x.onerror=()=>res({ok:false,text:'network error'});x.onabort=()=>res({ok:false,text:'cancelled'});x.send(body);});}
 async function doUpload(){
- const f=$('f').files[0]; if(!f) return msg('Select an APK');
+ const f=$('f').files[0],link=$('u').value.trim();
+ if(!f&&!link) return msg('APK select karo ya link daalo');
  localStorage.setItem('pw',$('pw').value);
+ if(!f){
+  msg('Link se APK download hone ke liye session start ho raha hai...');
+  const r0=await fetch('/api/start',{method:'POST',headers:{...H(),'content-type':'application/json'},body:JSON.stringify({url:link})});
+  if(!r0.ok) return msg('Start failed: '+await r0.text());
+  shown=''; $('out').innerHTML=''; poll(); return;
+ }
  const key=[...crypto.getRandomValues(new Uint8Array(12))].map(b=>b.toString(16).padStart(2,'0')).join('');
  const C=20*1024*1024, n=Math.ceil(f.size/C);
  if(n>10) return msg('APK bahut badi hai (max 200 MB)');
@@ -117,7 +126,16 @@ export default {
     }
     if (p === "/api/start" && req.method === "POST") {
       if (!userOk) return deny();
-      const { key } = await req.json();
+      const body = await req.json();
+      let key = body.key;
+      if (body.url) {
+        // APK is fetched by the GitHub runner straight from this link (kept private in KV, not in workflow inputs)
+        const link = String(body.url).trim();
+        let u; try { u = new URL(link); } catch (e) { return new Response("bad url", { status: 400 }); }
+        if (!/^https?:$/.test(u.protocol) || link.length > 2000) return new Response("bad url", { status: 400 });
+        key = rid();
+        await env.KV.put(`apk:${key}:url`, link);
+      }
       if (!KEYRE.test(key || "")) return new Response("bad key", { status: 400 });
       const id = rid(), token = rid();
       const r = await dispatch(env, id, token, key);
@@ -128,7 +146,7 @@ export default {
     if (p === "/api/current") {
       if (!userOk) return deny();
       const s = await getState(env);
-      return json({ id: s.id, token: s.token, url: s.url, stopped: !!s.stopped, nextPending: !!s.next });
+      return json({ id: s.id, token: s.token, url: s.url, error: s.error || null, stopped: !!s.stopped, nextPending: !!s.next });
     }
     if (p === "/api/stop" && req.method === "POST") {
       if (!userOk) return deny();
@@ -147,8 +165,9 @@ export default {
     }
     if (p === "/api/callback" && req.method === "POST") {
       if (!runnerOk) return deny();
-      const { id, url: u } = await req.json();
+      const { id, url: u, error } = await req.json();
       const s = await getState(env);
+      if (error) { if (s.id === id) { s.error = String(error).slice(0, 200); await setState(env, s); } return json({ ok: true }); }
       if (s.next && s.next.id === id) { s.id = id; s.token = s.next.token; s.url = u; s.next = null; }
       else if (s.id === id) s.url = u;
       await setState(env, s);
@@ -172,6 +191,10 @@ export default {
       if (!runnerOk) return deny();
       const [, , key, part] = p.split("/");
       if (!KEYRE.test(key || "")) return new Response("bad key", { status: 400 });
+      if (part === "url") {
+        const l = await env.KV.get(`apk:${key}:url`);
+        return l ? new Response(l) : new Response("missing", { status: 404 });
+      }
       if (part === "n") {
         const n = await env.KV.get(`apk:${key}:n`);
         return n ? new Response(n) : new Response("missing", { status: 404 });

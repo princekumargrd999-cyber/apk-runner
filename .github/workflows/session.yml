@@ -31,9 +31,32 @@ jobs:
         run: |
           H="Authorization: Bearer ${{ secrets.CALLBACK_SECRET }}"
           U="${{ secrets.WORKER_URL }}/apk/${{ inputs.apk_key }}"
-          N=$(curl -fsS -H "$H" "$U/n")
-          : > app.apk
-          for i in $(seq 0 $((N-1))); do curl -fsS -H "$H" "$U/$i" >> app.apk; done
+          fail() {
+            curl -s -X POST "${{ secrets.WORKER_URL }}/api/callback" -H "$H" -H "content-type: application/json" \
+              -d "{\"id\":\"${{ inputs.session_id }}\",\"error\":\"$1\"}" || true
+            echo "$1"; exit 1
+          }
+          if LINK=$(curl -fsS -H "$H" "$U/url"); then
+            echo "Downloading APK from the given link..."
+            case "$LINK" in
+              *drive.google.com*|*docs.google.com*)
+                pip install -q gdown
+                gdown --fuzzy "$LINK" -O app.apk || fail "Google Drive se download fail (file public hai?)" ;;
+              *)
+                case "$LINK" in *dropbox.com*)
+                  LINK=$(echo "$LINK" | sed 's/dl=0/dl=1/')
+                  case "$LINK" in *dl=1*) ;; *\?*) LINK="$LINK&dl=1" ;; *) LINK="$LINK?dl=1" ;; esac ;;
+                esac
+                curl -fL --retry 3 --connect-timeout 30 --max-time 900 -A "Mozilla/5.0" -o app.apk "$LINK" \
+                  || fail "Link se download fail (link direct aur public hona chahiye)" ;;
+            esac
+            [ "$(stat -c%s app.apk)" -gt 100000 ] || fail "Download ki hui file bahut chhoti hai - direct APK link do"
+            [ "$(head -c2 app.apk)" = "PK" ] || fail "Ye APK nahi hai (webpage aayi) - direct download link do"
+          else
+            N=$(curl -fsS -H "$H" "$U/n") || fail "APK server par nahi mili"
+            : > app.apk
+            for i in $(seq 0 $((N-1))); do curl -fsS -H "$H" "$U/$i" >> app.apk; done
+          fi
           ls -l app.apk
       - uses: reactivecircus/android-emulator-runner@v2
         env:

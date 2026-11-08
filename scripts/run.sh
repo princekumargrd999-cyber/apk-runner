@@ -3,7 +3,7 @@ set -u
 adb shell wm size 540x960
 adb shell wm density 240
 adb install -r -t app.apk || echo "install failed"
-SESSION_TOKEN="$SESSION_TOKEN" node runner/server.js &
+SESSION_TOKEN="$SESSION_TOKEN" SCRCPY_JAR="$PWD/scrcpy-server.jar" node runner/server.js > server.log 2>&1 &
 cloudflared tunnel --url http://localhost:8080 --no-autoupdate > tunnel.log 2>&1 &
 URL=""
 for i in $(seq 1 40); do

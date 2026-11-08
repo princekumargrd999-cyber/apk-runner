@@ -1,0 +1,100 @@
+<!doctype html>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,user-scalable=no">
+<title>APK Runner</title>
+<style>
+html,body{margin:0;background:#111;color:#fff;font:13px sans-serif;text-align:center}
+#c{max-height:86vh;max-width:100%;touch-action:none;user-select:none;-webkit-user-select:none;background:#000;outline:0}
+button{padding:10px 16px;margin:4px;font-size:15px}
+#st{opacity:.7;padding:3px}
+</style>
+<div id="st">connecting...</div>
+<canvas id="c" width="540" height="960" tabindex="0"></canvas>
+<div><button data-k="4">Back</button><button data-k="3">Home</button><button data-k="187">Recent</button></div>
+<script>
+const T = new URLSearchParams(location.search).get("t");
+const cv = document.getElementById("c"), ctx = cv.getContext("2d"), st = document.getElementById("st");
+let ws = null, dec = null, codec = "", started = false, ts = 0, latest = null, frames = 0, msg = "connecting...";
+let vw = 540, vh = 960;
+const send = o => { if (ws && ws.readyState === 1) ws.send(JSON.stringify(o)); };
+
+if (!("VideoDecoder" in window)) msg = "Is browser me WebCodecs nahi hai - Chrome use karo";
+
+// ---- video decode (H.264 Annex-B -> canvas) ----
+function findSps(u) { // returns [profile, constraints, level] of the first SPS
+  for (let i = 0; i + 6 < u.length; i++)
+    if (u[i] === 0 && u[i + 1] === 0 && u[i + 2] === 1 && (u[i + 3] & 31) === 7) return [u[i + 4], u[i + 5], u[i + 6]];
+  return null;
+}
+function initDecoder(c) {
+  try { dec && dec.state !== "closed" && dec.close(); } catch (e) {}
+  codec = c; started = false;
+  dec = new VideoDecoder({
+    output: f => { if (latest) latest.close(); latest = f; },   // keep only the newest frame -> no lag build-up
+    error: e => { msg = "decoder error: " + e.message; codec = ""; started = false; send({ t: "idr" }); },
+  });
+  dec.configure({ codec: c, optimizeForLatency: true });
+}
+function draw() {
+  if (latest) {
+    const f = latest; latest = null;
+    if (cv.width !== f.displayWidth || cv.height !== f.displayHeight) { cv.width = vw = f.displayWidth; cv.height = vh = f.displayHeight; }
+    ctx.drawImage(f, 0, 0); f.close(); frames++;
+  }
+  requestAnimationFrame(draw);
+}
+requestAnimationFrame(draw);
+setInterval(() => { st.textContent = msg + " | " + frames + " fps"; frames = 0; }, 1000);
+
+function connect() {
+  ws = new WebSocket((location.protocol === "https:" ? "wss://" : "ws://") + location.host + "/ws?t=" + encodeURIComponent(T));
+  ws.binaryType = "arraybuffer";
+  ws.onopen = () => { msg = "connected"; started = false; };
+  ws.onclose = () => { msg = "reconnecting..."; setTimeout(connect, 1000); };
+  ws.onmessage = ev => {
+    if (typeof ev.data === "string") { msg = JSON.parse(ev.data).status; return; }
+    if (!("VideoDecoder" in window)) return;
+    const u = new Uint8Array(ev.data), key = u[0] === 1, data = u.subarray(1);
+    if (key) {
+      const p = findSps(data);
+      if (p) {
+        const c = "avc1." + p.map(b => b.toString(16).padStart(2, "0")).join("");
+        if (c !== codec || !dec || dec.state === "closed") initDecoder(c);
+      }
+    }
+    if (!dec || dec.state !== "configured") return;
+    if (!started) { if (!key) return; started = true; }
+    dec.decode(new EncodedVideoChunk({ type: key ? "key" : "delta", timestamp: (ts += 33333), data }));
+  };
+}
+connect();
+
+// ---- touch ----
+const ptr = new Map(); // browser pointerId -> small id for Android
+const pid = e => {
+  if (!ptr.has(e.pointerId)) { const used = new Set(ptr.values()); let i = 0; while (used.has(i)) i++; ptr.set(e.pointerId, i); }
+  return ptr.get(e.pointerId);
+};
+function touch(a, e) {
+  const r = cv.getBoundingClientRect();
+  send({ t: "touch", a, id: pid(e), x: Math.round((e.clientX - r.left) / r.width * vw), y: Math.round((e.clientY - r.top) / r.height * vh), w: vw, h: vh });
+}
+cv.addEventListener("pointerdown", e => { e.preventDefault(); cv.setPointerCapture(e.pointerId); cv.focus(); touch(0, e); });
+let lastMove = 0;
+cv.addEventListener("pointermove", e => {
+  if (!ptr.has(e.pointerId)) return;
+  const n = performance.now(); if (n - lastMove < 12) return; lastMove = n; touch(2, e);
+});
+const up = e => { if (!ptr.has(e.pointerId)) return; touch(1, e); ptr.delete(e.pointerId); };
+cv.addEventListener("pointerup", up); cv.addEventListener("pointercancel", up);
+cv.addEventListener("contextmenu", e => e.preventDefault());
+
+// ---- buttons + keyboard (Chromebook keyboard works) ----
+document.querySelectorAll("button[data-k]").forEach(b => b.onclick = () => send({ t: "key", c: +b.dataset.k }));
+const KEYS = { Enter: 66, Backspace: 67, Tab: 61, Escape: 4, ArrowUp: 19, ArrowDown: 20, ArrowLeft: 21, ArrowRight: 22, Delete: 112 };
+addEventListener("keydown", e => {
+  if (e.ctrlKey || e.metaKey || e.altKey) return;
+  if (KEYS[e.key]) { send({ t: "key", c: KEYS[e.key] }); e.preventDefault(); }
+  else if (e.key.length === 1) { send({ t: "text", s: e.key }); e.preventDefault(); }
+});
+</script>

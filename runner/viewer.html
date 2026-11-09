@@ -16,7 +16,7 @@ button{padding:10px 16px;margin:4px;font-size:15px}
 <script>
 const T = new URLSearchParams(location.search).get("t");
 const cv = document.getElementById("c"), ctx = cv.getContext("2d", { alpha: false, desynchronized: true }), st = document.getElementById("st");
-let ws = null, rtt = 0, quality = "", dec = null, codec = "", started = false, ts = 0, latest = null, frames = 0, msg = "connecting...";
+let ws = null, rt = null, lastMsg = performance.now(), fed = 0, preferSw = false, rtt = 0, quality = "", dec = null, codec = "", started = false, ts = 0, latest = null, frames = 0, msg = "connecting...";
 let vw = 540, vh = 960;
 const send = o => { if (ws && ws.readyState === 1) ws.send(JSON.stringify(o)); };
 
@@ -32,10 +32,10 @@ function initDecoder(c) {
   try { dec && dec.state !== "closed" && dec.close(); } catch (e) {}
   codec = c; started = false;
   dec = new VideoDecoder({
-    output: f => { if (latest) latest.close(); latest = f; },   // keep only the newest frame -> no lag build-up
+    output: f => { fed = 0; if (latest) latest.close(); latest = f; },   // keep only the newest frame -> no lag build-up
     error: e => { msg = "decoder error: " + e.message; codec = ""; started = false; send({ t: "idr" }); },
   });
-  dec.configure({ codec: c, optimizeForLatency: true, hardwareAcceleration: "prefer-hardware" });
+  dec.configure({ codec: c, optimizeForLatency: true, hardwareAcceleration: preferSw ? "prefer-software" : "prefer-hardware" });
 }
 function draw() {
   if (latest) {
@@ -51,11 +51,15 @@ setInterval(() => { st.textContent = msg + " | " + frames + " fps | " + rtt + " 
 setInterval(() => send({ t: "ping", ts: performance.now() }), 2000);
 
 function connect() {
+  clearTimeout(rt);
+  if (ws) { ws.onopen = ws.onclose = ws.onmessage = null; try { ws.close(); } catch (e) {} }
+  lastMsg = performance.now();
   ws = new WebSocket((location.protocol === "https:" ? "wss://" : "ws://") + location.host + "/ws?t=" + encodeURIComponent(T));
   ws.binaryType = "arraybuffer";
   ws.onopen = () => { msg = "connected"; started = false; };
-  ws.onclose = () => { msg = "reconnecting..."; setTimeout(connect, 1000); };
+  ws.onclose = () => { msg = "reconnecting..."; rt = setTimeout(connect, 1000); };
   ws.onmessage = ev => {
+    lastMsg = performance.now();
     if (typeof ev.data === "string") {
       const j = JSON.parse(ev.data);
       if (j.pong !== undefined) rtt = Math.round(performance.now() - j.pong);
@@ -74,10 +78,22 @@ function connect() {
     }
     if (!dec || dec.state !== "configured") return;
     if (!started) { if (!key) return; started = true; }
+    fed++;
     dec.decode(new EncodedVideoChunk({ type: key ? "key" : "delta", timestamp: (ts += 33333), data }));
   };
 }
 connect();
+
+// ---- watchdogs ----
+setInterval(() => {                       // server heartbeat every 5s; silence for 12s = dead tunnel/socket
+  if (performance.now() - lastMsg > 12000) { msg = "connection lost, reconnecting..."; connect(); }
+}, 3000);
+setInterval(() => {                       // decoder fed but nothing comes out = stuck (often the hardware decoder)
+  if (dec && started && fed > 45) {
+    preferSw = true; fed = 0; msg = "decoder stuck -> software decoder";
+    initDecoder(codec); send({ t: "idr" });
+  }
+}, 1000);
 
 // ---- touch ----
 const ptr = new Map(); // browser pointerId -> small id for Android

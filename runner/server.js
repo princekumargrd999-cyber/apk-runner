@@ -31,6 +31,9 @@ let ctl = null;          // scrcpy control socket (touch / keys / text)
 let cfg = null;          // latest SPS+PPS (config packet)
 let status = "starting emulator stream...";
 const clients = new Set();
+let lastPacket = Date.now(), nudged = false;
+process.on("uncaughtException", e => log("uncaught:", e && e.stack || e));
+process.on("unhandledRejection", e => log("unhandled:", e && e.stack || e));
 
 // ---------- control messages (scrcpy protocol) ----------
 let lastIdr = 0;
@@ -70,6 +73,7 @@ function sendText(s) {
 // ---------- video packets from scrcpy ----------
 // packet = 8 bytes (pts + flags: bit63 config, bit62 keyframe) + 4 bytes size + payload (Annex-B H.264)
 function onPacket(isConfig, isKey, data) {
+  lastPacket = Date.now(); nudged = false;
   if (isConfig) { cfg = Buffer.from(data); return; }
   const out = Buffer.concat([Buffer.from([isKey ? 1 : 0]), ...(isKey && cfg ? [cfg] : []), data]);
   for (const c of clients) {
@@ -138,6 +142,7 @@ async function session() {
   if (!control) { proc.kill(); video.s.destroy(); throw new Error("could not connect to scrcpy control socket"); }
 
   ctl = control.s;
+  lastPacket = Date.now();
   ctl.on("error", () => {}); ctl.on("data", () => {}); // ignore device->client messages
   status = "live";
   broadcastStatus();
@@ -180,7 +185,8 @@ server.on("upgrade", (req, sock, head) => {
   wss.handleUpgrade(req, sock, head, ws => wss.emit("connection", ws));
 });
 wss.on("connection", ws => {
-  const c = { ws, needKey: true };
+  const c = { ws, needKey: true, wait: 0, alive: true };
+  ws.on("pong", () => { c.alive = true; });
   clients.add(c);
   ws.send(JSON.stringify({ status, quality }));
   requestKeyframe();
@@ -197,5 +203,24 @@ wss.on("connection", ws => {
   ws.on("close", () => clients.delete(c));
   ws.on("error", () => clients.delete(c));
 });
+// ---------- keep-alive + watchdogs (why streams used to "just stop") ----------
+setInterval(() => broadcastStatus(), 5000);            // heartbeat: browser reconnects if it hears nothing for 12s
+setInterval(() => {                                    // WebSocket-level ping: keeps tunnel open, drops dead clients
+  for (const c of clients) {
+    if (!c.alive) { log("client timed out"); c.ws.terminate(); clients.delete(c); continue; }
+    c.alive = false; try { c.ws.ping(); } catch (e) {}
+  }
+}, 20000);
+setInterval(() => {
+  if (!ctl) return;
+  for (const c of clients) {                           // client waiting for a keyframe for >4s -> ask encoder for one
+    if (c.needKey) { if (++c.wait >= 2) { c.wait = 0; requestKeyframe(); } } else c.wait = 0;
+  }
+  if (!clients.size) return;
+  const idle = Date.now() - lastPacket;
+  if (idle > 25000) { log("no video for 25s -> restarting scrcpy"); lastPacket = Date.now(); if (curProc) curProc.kill(); }
+  else if (idle > 8000 && !nudged) { nudged = true; log("no video for 8s -> forcing keyframe"); requestKeyframe(); }
+}, 2000);
+setInterval(() => log("alive | clients:", clients.size, "| quality:", quality, "| last video:", ((Date.now() - lastPacket) / 1000).toFixed(1) + "s ago"), 60000);
 server.listen(8080, () => log("listening on 8080"));
 supervise();

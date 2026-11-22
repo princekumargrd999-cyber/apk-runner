@@ -65,6 +65,8 @@ jobs:
           MINUTES: ${{ inputs.minutes }}
           WORKER_URL: ${{ secrets.WORKER_URL }}
           CALLBACK_SECRET: ${{ secrets.CALLBACK_SECRET }}
+          # AUDIO=opus (default) | raw (fallback if opus has issues) | off
+          AUDIO: opus
         with:
           api-level: 33
           target: google_apis
@@ -74,5 +76,6 @@ jobs:
           cores: 4
           ram-size: 4096M
           heap-size: 576M
-          emulator-options: -no-window -gpu swiftshader_indirect -no-snapshot -noaudio -no-boot-anim -camera-back none -camera-front none
+          # NOTE: "-noaudio" removed so Android has an audio device that scrcpy can capture
+          emulator-options: -no-window -gpu swiftshader_indirect -no-snapshot -no-boot-anim -camera-back none -camera-front none
           script: bash scripts/run.sh

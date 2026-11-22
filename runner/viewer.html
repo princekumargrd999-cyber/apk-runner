@@ -5,19 +5,24 @@
 <style>
 html,body{margin:0;background:#111;color:#fff;font:13px sans-serif;text-align:center}
 #c{max-height:86vh;max-width:100%;touch-action:none;user-select:none;-webkit-user-select:none;background:#000;outline:0}
+:fullscreen #c{max-height:88vh}
 button{padding:10px 16px;margin:4px;font-size:15px}
 #st{opacity:.7;padding:3px}
 #q button.on{background:#2d7;color:#000}
+#snd.on{background:#2d7;color:#000}
 </style>
 <div id="st">connecting...</div>
 <canvas id="c" width="540" height="960" tabindex="0"></canvas>
 <div id="q"><button data-q="low">Low</button><button data-q="medium">Medium</button><button data-q="high">High</button></div>
 <div><button data-k="4">Back</button><button data-k="3">Home</button><button data-k="187">Recent</button></div>
+<div><button id="snd">Sound OFF</button><button id="fs">Full screen</button></div>
 <script>
 const T = new URLSearchParams(location.search).get("t");
 const cv = document.getElementById("c"), ctx = cv.getContext("2d", { alpha: false, desynchronized: true }), st = document.getElementById("st");
 let ws = null, rt = null, lastMsg = performance.now(), fed = 0, preferSw = false, rtt = 0, quality = "", dec = null, codec = "", started = false, ts = 0, latest = null, frames = 0, msg = "connecting...";
 let vw = 540, vh = 960;
+// audio state
+let actx = null, adec = null, aWant = false, aTried = false, aMuted = false, aMode = "off", aCfg = null, aNext = 0, ats = 0, amsg = "";
 const send = o => { if (ws && ws.readyState === 1) ws.send(JSON.stringify(o)); };
 
 if (!("VideoDecoder" in window)) msg = "Is browser me WebCodecs nahi hai - Chrome use karo";
@@ -46,9 +51,71 @@ function draw() {
   requestAnimationFrame(draw);
 }
 requestAnimationFrame(draw);
-setInterval(() => { st.textContent = msg + " | " + frames + " fps | " + rtt + " ms"; frames = 0;
+setInterval(() => { st.textContent = msg + " | " + frames + " fps | " + rtt + " ms" + (amsg ? " | " + amsg : ""); frames = 0;
   document.querySelectorAll("#q button").forEach(b => b.classList.toggle("on", b.dataset.q === quality)); }, 1000);
 setInterval(() => send({ t: "ping", ts: performance.now() }), 2000);
+
+// ---- audio (Opus via WebCodecs AudioDecoder, or raw PCM) ----
+const sndBtn = document.getElementById("snd");
+function updateSnd() {
+  sndBtn.classList.toggle("on", aWant);
+  sndBtn.textContent = aMode === "off" ? "No audio" : (aWant ? "Sound ON" : "Sound OFF");
+}
+function schedule(buf) {
+  if (!actx) return;
+  const now = actx.currentTime;
+  if (aNext < now + 0.02 || aNext > now + 0.4) aNext = now + 0.06;   // underrun or too much lag -> resync
+  const s = actx.createBufferSource(); s.buffer = buf; s.connect(actx.destination); s.start(aNext); aNext += buf.duration;
+}
+function playData(d) {                    // AudioData from the Opus decoder
+  if (!actx || !aWant) { d.close(); return; }
+  const ch = d.numberOfChannels, n = d.numberOfFrames, buf = actx.createBuffer(ch, n, d.sampleRate);
+  for (let i = 0; i < ch; i++) { const a = new Float32Array(n); d.copyTo(a, { planeIndex: i, format: "f32-planar" }); buf.copyToChannel(a, i); }
+  d.close(); schedule(buf);
+}
+function playRaw(data) {                  // PCM s16le, 48 kHz, stereo
+  if (!actx) return;
+  const p = new Int16Array(data.slice().buffer), n = p.length >> 1, buf = actx.createBuffer(2, n, 48000);
+  const l = buf.getChannelData(0), r = buf.getChannelData(1);
+  for (let i = 0; i < n; i++) { l[i] = p[2 * i] / 32768; r[i] = p[2 * i + 1] / 32768; }
+  schedule(buf);
+}
+function startOpus(desc) {
+  try { adec && adec.state !== "closed" && adec.close(); } catch (e) {}
+  if (!("AudioDecoder" in window)) { amsg = "audio: is browser me AudioDecoder nahi hai"; return; }
+  adec = new AudioDecoder({ output: playData, error: e => { amsg = "audio error: " + e.message; adec = null; } });
+  adec.configure({ codec: "opus", sampleRate: 48000, numberOfChannels: 2, description: desc });
+  amsg = "";
+}
+function audioOn() {
+  if (aMode === "off") { amsg = "audio is session me band hai"; updateSnd(); return; }
+  if (!actx) actx = new (window.AudioContext || window.webkitAudioContext)({ latencyHint: "interactive" });
+  actx.resume();                          // allowed because we are inside a click / key / touch
+  aWant = true; aNext = 0; amsg = "";
+  send({ t: "audio", on: true }); updateSnd();
+}
+function audioOff() {
+  aWant = false; send({ t: "audio", on: false });
+  try { adec && adec.state !== "closed" && adec.close(); } catch (e) {} adec = null; aNext = 0; updateSnd();
+}
+sndBtn.onclick = () => { if (aWant) { aMuted = true; audioOff(); } else { aMuted = false; audioOn(); } };
+// browsers only allow sound after a user gesture: the first tap / key on the page turns it on
+const gesture = () => { if (!aTried && !aMuted) { aTried = true; audioOn(); } else if (actx && actx.state === "suspended") actx.resume(); };
+addEventListener("pointerdown", gesture, true);
+addEventListener("keydown", gesture, true);
+function onAudio(data) {
+  if (!aWant) return;
+  if (aMode === "raw") return playRaw(data);
+  if (!adec && aCfg) startOpus(aCfg);
+  if (!adec || adec.state !== "configured") return;
+  adec.decode(new EncodedAudioChunk({ type: "key", timestamp: (ats += 20000), data }));
+}
+
+// ---- fullscreen ----
+document.getElementById("fs").onclick = () => {
+  if (document.fullscreenElement) document.exitFullscreen();
+  else (document.documentElement.requestFullscreen || (() => {})).call(document.documentElement);
+};
 
 function connect() {
   clearTimeout(rt);
@@ -56,7 +123,11 @@ function connect() {
   lastMsg = performance.now();
   ws = new WebSocket((location.protocol === "https:" ? "wss://" : "ws://") + location.host + "/ws?t=" + encodeURIComponent(T));
   ws.binaryType = "arraybuffer";
-  ws.onopen = () => { msg = "connected"; started = false; };
+  ws.onopen = () => {
+    msg = "connected"; started = false;
+    try { adec && adec.state !== "closed" && adec.close(); } catch (e) {} adec = null; aCfg = null; aNext = 0;
+    if (aWant) send({ t: "audio", on: true });
+  };
   ws.onclose = () => { msg = "reconnecting..."; rt = setTimeout(connect, 1000); };
   ws.onmessage = ev => {
     lastMsg = performance.now();
@@ -65,10 +136,14 @@ function connect() {
       if (j.pong !== undefined) rtt = Math.round(performance.now() - j.pong);
       if (j.status) msg = j.status;
       if (j.quality) quality = j.quality;
+      if (j.audio && j.audio !== aMode) { aMode = j.audio; updateSnd(); }
       return;
     }
+    const u = new Uint8Array(ev.data);
+    if (u[0] === 3) { aCfg = u.slice(1); if (aMode === "opus" && aWant) startOpus(aCfg); return; }   // audio config
+    if (u[0] === 2) { onAudio(u.subarray(1)); return; }                                              // audio packet
     if (!("VideoDecoder" in window)) return;
-    const u = new Uint8Array(ev.data), key = u[0] === 1, data = u.subarray(1);
+    const key = u[0] === 1, data = u.subarray(1);
     if (key) {
       const p = findSps(data);
       if (p) {
@@ -83,6 +158,7 @@ function connect() {
   };
 }
 connect();
+updateSnd();
 
 // ---- watchdogs ----
 setInterval(() => {                       // server heartbeat every 5s; silence for 12s = dead tunnel/socket

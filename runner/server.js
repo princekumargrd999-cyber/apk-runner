@@ -1,6 +1,7 @@
-// Real-time screen streaming server.
-//   scrcpy-server (H.264, on the emulator) --adb forward--> this file --WebSocket--> browser (WebCodecs)
-// No PNG polling any more: the browser gets a live H.264 video + low-latency touch/keyboard input.
+// Real-time screen + AUDIO streaming server.
+//   scrcpy-server (H.264 video + Opus audio, on the emulator) --adb forward--> this file --WebSocket--> browser
+// Browser -> server: touch / keyboard / quality / audio on-off
+// Server -> browser binary frames: [0|1]+H264 (video), [2]+audio packet, [3]+audio config (OpusHead)
 const http = require("http");
 const net = require("net");
 const fs = require("fs");
@@ -11,7 +12,9 @@ const { WebSocketServer } = require("ws");
 const TOKEN = process.env.SESSION_TOKEN;
 const JAR = process.env.SCRCPY_JAR || path.join(process.cwd(), "scrcpy-server.jar");
 const VER = process.env.SCRCPY_VER || "3.1";          // must match the downloaded scrcpy-server version
-// Quality presets (device screen is 720x1280 -> "low" is downscaled to 540x960 before encoding)
+// Audio: "opus" (small, 128 kbps), "raw" (PCM, no decoder needed, ~1.5 Mbps), "off"
+const AUDIO = ["opus", "raw", "off"].includes(process.env.AUDIO) ? process.env.AUDIO : "opus";
+let AUDIO_ON = AUDIO !== "off";
 const PRESETS = {
   low:    { size: 960,  br: 2000000,  fps: 24 },
   medium: { size: 1280, br: 5000000,  fps: 30 },
@@ -19,7 +22,8 @@ const PRESETS = {
 };
 let quality = PRESETS[process.env.QUALITY] ? process.env.QUALITY : "medium";
 const FWD_PORT = 27183;
-const MAX_BUFFERED = 300 * 1024;                       // client behind by ~200ms+ -> drop frames until next keyframe
+const MAX_BUFFERED = 300 * 1024;                       // video: client behind -> drop frames until next keyframe
+const MAX_AUDIO_BUFFERED = 400 * 1024;                 // audio: client behind -> drop audio packets
 const PAGE = fs.readFileSync(path.join(__dirname, "viewer.html"));
 
 const log = (...a) => console.log(new Date().toISOString().slice(11, 19), ...a);
@@ -28,8 +32,10 @@ const adb = args => new Promise((res, rej) =>
   execFile("adb", args, { maxBuffer: 8e6 }, (e, out, err) => (e ? rej(new Error(err || e.message)) : res(out))));
 
 let ctl = null;          // scrcpy control socket (touch / keys / text)
-let cfg = null;          // latest SPS+PPS (config packet)
+let cfg = null;          // latest SPS+PPS (video config packet)
+let aCfg = null;         // audio config packet (OpusHead)
 let status = "starting emulator stream...";
+let liveReached = false;
 const clients = new Set();
 let lastPacket = Date.now(), nudged = false;
 process.on("uncaughtException", e => log("uncaught:", e && e.stack || e));
@@ -70,8 +76,8 @@ function sendText(s) {
   ctl.write(b);
 }
 
-// ---------- video packets from scrcpy ----------
-// packet = 8 bytes (pts + flags: bit63 config, bit62 keyframe) + 4 bytes size + payload (Annex-B H.264)
+// ---------- packets from scrcpy ----------
+// packet = 8 bytes (pts + flags: bit63 config, bit62 keyframe) + 4 bytes size + payload
 function onPacket(isConfig, isKey, data) {
   lastPacket = Date.now(); nudged = false;
   if (isConfig) { cfg = Buffer.from(data); return; }
@@ -83,7 +89,21 @@ function onPacket(isConfig, isKey, data) {
     c.ws.send(out, { binary: true });
   }
 }
-function feedVideo(sock, first) {
+function onAudioPacket(isConfig, isKey, data) {
+  if (isConfig) {
+    aCfg = Buffer.from(data);
+    const m = Buffer.concat([Buffer.from([3]), aCfg]);
+    for (const c of clients) if (c.audio && c.ws.readyState === 1) c.ws.send(m, { binary: true });
+    return;
+  }
+  const out = Buffer.concat([Buffer.from([2]), data]);
+  for (const c of clients) {
+    if (!c.audio || c.ws.readyState !== 1) continue;
+    if (c.ws.bufferedAmount > MAX_AUDIO_BUFFERED) continue;   // drop audio instead of building up lag
+    c.ws.send(out, { binary: true });
+  }
+}
+function feedStream(sock, first, handler) {
   let buf = first;
   const eat = () => {
     while (buf.length >= 12) {
@@ -92,7 +112,7 @@ function feedVideo(sock, first) {
       const flags = buf[0];
       const payload = buf.subarray(12, 12 + size);
       buf = buf.subarray(12 + size);
-      onPacket(!!(flags & 0x80), !!(flags & 0x40), payload);
+      handler(!!(flags & 0x80), !!(flags & 0x40), payload);
     }
   };
   eat();
@@ -122,46 +142,63 @@ async function session() {
   const scid = Math.floor(Math.random() * 0x7fffffff).toString(16).padStart(8, "0"); // unique socket name per session
   await adb(["forward", `tcp:${FWD_PORT}`, `localabstract:scrcpy_${scid}`]);
   const opts = [
-    `${VER}`, `scid=${scid}`, "log_level=info", "tunnel_forward=true", "video=true", "audio=false", "control=true",
+    `${VER}`, `scid=${scid}`, "log_level=info", "tunnel_forward=true", "video=true", `audio=${AUDIO_ON}`, "control=true",
     "send_device_meta=false", "send_frame_meta=true", "send_codec_meta=false",
     `max_size=${q.size}`, `video_bit_rate=${q.br}`, `max_fps=${q.fps}`, "video_codec=h264", "stay_awake=true",
     "video_codec_options=i-frame-interval=2",                      // keyframe every 2s -> fast recovery after dropped frames
+    ...(AUDIO_ON ? [`audio_codec=${AUDIO}`, "audio_source=output", ...(AUDIO === "opus" ? ["audio_bit_rate=128000"] : [])] : []),
   ].join(" ");
-  log("starting scrcpy, quality =", quality, JSON.stringify(q));
+  log("starting scrcpy, quality =", quality, JSON.stringify(q), "audio =", AUDIO_ON ? AUDIO : "off");
   const proc = spawn("adb", ["shell", `CLASSPATH=/data/local/tmp/scrcpy-server.jar app_process / com.genymobile.scrcpy.Server ${opts}`]);
   curProc = proc;
   proc.stdout.on("data", d => log("[scrcpy]", String(d).trim()));
   proc.stderr.on("data", d => log("[scrcpy]", String(d).trim()));
   const exited = new Promise(r => proc.on("exit", r));
 
+  // scrcpy accepts the sockets in this order: video, audio, control
   let video = null;
   for (let i = 0; i < 40 && !video; i++) { await sleep(500); video = await tryConnect(true); }
   if (!video) { proc.kill(); throw new Error("could not connect to scrcpy video socket"); }
+  let audio = null;
+  if (AUDIO_ON) {
+    audio = await tryConnect(false);
+    if (!audio) { proc.kill(); video.s.destroy(); throw new Error("could not connect to scrcpy audio socket"); }
+  }
   let control = null;
   for (let i = 0; i < 20 && !control; i++) control = await tryConnect(false);
-  if (!control) { proc.kill(); video.s.destroy(); throw new Error("could not connect to scrcpy control socket"); }
+  if (!control) { proc.kill(); video.s.destroy(); audio && audio.s.destroy(); throw new Error("could not connect to scrcpy control socket"); }
 
   ctl = control.s;
   lastPacket = Date.now();
   ctl.on("error", () => {}); ctl.on("data", () => {}); // ignore device->client messages
+  liveReached = true;
   status = "live";
   broadcastStatus();
   log("scrcpy connected");
-  feedVideo(video.s, video.rest);
+  if (audio) {
+    audio.s.on("error", () => {});
+    feedStream(audio.s, Buffer.alloc(0), onAudioPacket);
+  }
+  feedStream(video.s, video.rest, onPacket);
   await Promise.race([new Promise(r => video.s.on("close", r)), exited]);
-  ctl && ctl.destroy(); ctl = null; video.s.destroy(); proc.kill();
+  ctl && ctl.destroy(); ctl = null; video.s.destroy(); audio && audio.s.destroy(); proc.kill();
 }
 async function supervise() {
+  let bad = 0;
   for (;;) {
+    liveReached = false;
     try { await session(); } catch (e) { log("session error:", e.message); }
-    cfg = null; status = "reconnecting stream...";
+    // if scrcpy never came up with audio twice in a row, drop audio so the video still works
+    if (AUDIO_ON && !liveReached) { if (++bad >= 2) { AUDIO_ON = false; log("audio disabled after 2 failed starts"); } } else bad = 0;
+    cfg = null; aCfg = null; status = "reconnecting stream...";
     broadcastStatus();
     for (const c of clients) c.needKey = true;
     await sleep(1500);
   }
 }
+const audioMode = () => (AUDIO_ON ? AUDIO : "off");
 function broadcastStatus() {
-  for (const c of clients) if (c.ws.readyState === 1) c.ws.send(JSON.stringify({ status, quality }));
+  for (const c of clients) if (c.ws.readyState === 1) c.ws.send(JSON.stringify({ status, quality, audio: audioMode() }));
 }
 
 function setQuality(q) {
@@ -185,10 +222,10 @@ server.on("upgrade", (req, sock, head) => {
   wss.handleUpgrade(req, sock, head, ws => wss.emit("connection", ws));
 });
 wss.on("connection", ws => {
-  const c = { ws, needKey: true, wait: 0, alive: true };
+  const c = { ws, needKey: true, wait: 0, alive: true, audio: false };
   ws.on("pong", () => { c.alive = true; });
   clients.add(c);
-  ws.send(JSON.stringify({ status, quality }));
+  ws.send(JSON.stringify({ status, quality, audio: audioMode() }));
   requestKeyframe();
   ws.on("message", (m, isBinary) => {
     if (isBinary) return;
@@ -199,6 +236,10 @@ wss.on("connection", ws => {
     else if (j.t === "idr") { c.needKey = true; requestKeyframe(); }
     else if (j.t === "ping") ws.send(JSON.stringify({ pong: j.ts }));
     else if (j.t === "quality") setQuality(j.q);
+    else if (j.t === "audio") {                        // browser turns sound on/off (needs a user click first)
+      c.audio = !!j.on;
+      if (c.audio && aCfg) ws.send(Buffer.concat([Buffer.from([3]), aCfg]), { binary: true });
+    }
   });
   ws.on("close", () => clients.delete(c));
   ws.on("error", () => clients.delete(c));
@@ -221,6 +262,6 @@ setInterval(() => {
   if (idle > 25000) { log("no video for 25s -> restarting scrcpy"); lastPacket = Date.now(); if (curProc) curProc.kill(); }
   else if (idle > 8000 && !nudged) { nudged = true; log("no video for 8s -> forcing keyframe"); requestKeyframe(); }
 }, 2000);
-setInterval(() => log("alive | clients:", clients.size, "| quality:", quality, "| last video:", ((Date.now() - lastPacket) / 1000).toFixed(1) + "s ago"), 60000);
+setInterval(() => log("alive | clients:", clients.size, "| quality:", quality, "| audio:", audioMode(), "| last video:", ((Date.now() - lastPacket) / 1000).toFixed(1) + "s ago"), 60000);
 server.listen(8080, () => log("listening on 8080"));
 supervise();

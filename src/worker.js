@@ -1,9 +1,12 @@
 const PAGE = `<!doctype html><meta name=viewport content="width=device-width,initial-scale=1">
+<link rel=manifest href="/manifest.webmanifest"><meta name=theme-color content="#111111">
 <title>APK Runner</title>
 <style>body{font:16px sans-serif;max-width:520px;margin:20px auto;padding:0 14px}
 input,button{width:100%;padding:12px;margin:6px 0;font-size:16px;box-sizing:border-box}
-iframe{width:100%;height:80vh;border:0;margin-top:10px}</style>
+iframe{width:100%;height:80vh;border:0;margin-top:10px}
+@media (display-mode:standalone){body{max-width:none}iframe{height:88vh}}</style>
 <h2>APK Runner</h2>
+<button id=inst style="display:none">Install app (Chromebook / phone)</button>
 <input id=pw type=password placeholder="Password">
 <input id=f type=file accept=".apk">
 <input id=u type=url placeholder="Ya APK ka direct link (https://...)" autocomplete=off>
@@ -17,6 +20,12 @@ const $=i=>document.getElementById(i),msg=t=>$('msg').textContent=t;
 const H=()=>({'x-password':$('pw').value});
 let shown='',iv=null;
 $('pw').value=localStorage.getItem('pw')||'';
+// ---- PWA: install as an app ----
+if('serviceWorker' in navigator) navigator.serviceWorker.register('/sw.js').catch(()=>{});
+let dp=null;
+addEventListener('beforeinstallprompt',e=>{e.preventDefault();dp=e;$('inst').style.display='block';});
+addEventListener('appinstalled',()=>{$('inst').style.display='none';});
+$('inst').onclick=async()=>{if(!dp)return;dp.prompt();try{await dp.userChoice;}catch(e){}dp=null;$('inst').style.display='none';};
 function poll(){
  clearInterval(iv);
  const tick=async()=>{
@@ -27,8 +36,8 @@ function poll(){
   if(!c.url){ if(!shown) msg('Emulator start ho raha hai, 3-5 minute...'); return; }
   const key=c.id+c.url; if(key===shown) return;
   const re=!!shown; shown=key; const u=c.url+'/?t='+c.token;
-  msg(re?'Naya session shuru hua (app phir se install hui)':'Ready');
-  $('out').innerHTML='<a href="'+u+'" target=_blank>Open full screen</a><iframe src="'+u+'"></iframe>';
+  msg(re?'Naya session shuru hua (app phir se install hui)':'Ready - screen par ek baar tap karo, awaaz chalu ho jayegi');
+  $('out').innerHTML='<a href="'+u+'" target=_blank>Open full screen</a><iframe allow="autoplay; fullscreen" allowfullscreen src="'+u+'"></iframe>';
  };
  tick(); iv=setInterval(tick,6000);
 }
@@ -84,6 +93,18 @@ $('stop').onclick=async()=>{
 if($('pw').value) poll();
 </script>`;
 
+// ---- PWA files (install as app) ----
+const ICON = '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><rect width="512" height="512" rx="96" fill="#111"/><rect x="156" y="96" width="200" height="320" rx="28" fill="none" stroke="#2d7" stroke-width="22"/><polygon points="226,196 226,316 320,256" fill="#2d7"/></svg>';
+const MANIFEST = JSON.stringify({
+  name: "APK Runner", short_name: "APK Runner", start_url: "/", scope: "/", display: "standalone",
+  background_color: "#111111", theme_color: "#111111",
+  icons: [
+    { src: "/icon.svg", sizes: "192x192", type: "image/svg+xml", purpose: "any" },
+    { src: "/icon.svg", sizes: "512x512", type: "image/svg+xml", purpose: "any" },
+  ],
+});
+const SW = "self.addEventListener('install',()=>self.skipWaiting());self.addEventListener('activate',e=>e.waitUntil(self.clients.claim()));self.addEventListener('fetch',()=>{});";
+
 const json = (o, s = 200) => new Response(JSON.stringify(o), { status: s, headers: { "content-type": "application/json" } });
 const rid = () => [...crypto.getRandomValues(new Uint8Array(12))].map(b => b.toString(16).padStart(2, "0")).join("");
 const MINUTES = "335"; // max for a GitHub-hosted job is 360 min including setup
@@ -106,6 +127,9 @@ export default {
     const deny = () => new Response("unauthorized", { status: 401 });
 
     if (p === "/") return new Response(PAGE, { headers: { "content-type": "text/html;charset=utf-8" } });
+    if (p === "/manifest.webmanifest") return new Response(MANIFEST, { headers: { "content-type": "application/manifest+json" } });
+    if (p === "/sw.js") return new Response(SW, { headers: { "content-type": "application/javascript", "cache-control": "no-cache" } });
+    if (p === "/icon.svg") return new Response(ICON, { headers: { "content-type": "image/svg+xml", "cache-control": "public, max-age=86400" } });
 
     // APK is uploaded in 20 MB chunks (KV value limit is 25 MB)
     if (p === "/api/upload" && req.method === "PUT") {
